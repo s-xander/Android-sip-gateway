@@ -13,6 +13,16 @@ public class GatewayCall extends Call {
 
     private SipCallService service;
     private volatile boolean disposed = false;
+    // Explicit SIM override parsed from the SIP INVITE (0 = use legacy routing).
+    private int requestedGsmSimSlot = 0;
+
+    public void setRequestedGsmSimSlot(int slot) {
+        requestedGsmSimSlot = (slot == 1 || slot == 2) ? slot : 0;
+    }
+
+    public int getRequestedGsmSimSlot() {
+        return requestedGsmSimSlot;
+    }
 
     /**
      * Constructor for outgoing calls

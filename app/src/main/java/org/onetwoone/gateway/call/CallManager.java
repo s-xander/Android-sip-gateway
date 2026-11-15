@@ -166,9 +166,12 @@ public class CallManager {
         // Extract destination from LOCAL URI (the number being called = GSM destination)
         String dest = extractPhoneNumber(localUri);
 
-        // Determine SIM slot from caller extension in remote URI
-        String callerExt = extractExtension(remoteUri);
-        int simSlot = config.getSimSlotForCaller(callerExt);
+        // An explicit X-GSM-SIM header overrides the legacy extension mapping.
+        int simSlot = call.getRequestedGsmSimSlot();
+        if (simSlot == 0) {
+            String callerExt = extractExtension(remoteUri);
+            simSlot = config.getSimSlotForCaller(callerExt);
+        }
 
         if (dest == null || dest.isEmpty()) {
             Log.e(TAG, "No destination in localUri: " + localUri);

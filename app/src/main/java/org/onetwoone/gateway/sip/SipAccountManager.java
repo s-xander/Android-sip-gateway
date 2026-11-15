@@ -27,7 +27,7 @@ public class SipAccountManager {
 
     public interface AccountListener {
         void onRegistrationState(boolean registered, String reason);
-        void onIncomingCall(GatewayAccount account, int callId);
+        void onIncomingCall(GatewayAccount account, int callId, int requestedSimSlot);
         void onInstantMessage(String from, String to, String body, int simSlot);
     }
 
@@ -226,8 +226,18 @@ public class SipAccountManager {
         public void onIncomingCall(OnIncomingCallParam prm) {
             Log.d(TAG, "Incoming call, callId=" + prm.getCallId());
 
+            int requestedSimSlot = 0;
+            try {
+                SipRxData receivedData = prm.getRdata();
+                if (receivedData != null) {
+                    requestedSimSlot = SimSelectionHeader.parse(receivedData.getWholeMsg());
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Could not parse X-GSM-SIM header: " + e.getMessage());
+            }
+
             if (listener != null) {
-                listener.onIncomingCall(this, prm.getCallId());
+                listener.onIncomingCall(this, prm.getCallId(), requestedSimSlot);
             }
         }
 
