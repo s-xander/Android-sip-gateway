@@ -18,6 +18,8 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - name: Install Android SDK, NDK and CMake
         run: |
           sdkmanager "platforms;android-36" "build-tools;36.1.0" "ndk;21.4.7075529" "cmake;3.22.1"
