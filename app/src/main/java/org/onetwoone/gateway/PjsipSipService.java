@@ -312,9 +312,10 @@ public class PjsipSipService extends Service implements SipCallService {
         }
 
         @Override
-        public void onIncomingCall(GatewayAccount account, int callId) {
+        public void onIncomingCall(GatewayAccount account, int callId, int requestedSimSlot) {
             try {
                 GatewayCall call = new GatewayCall(PjsipSipService.this, account, callId);
+                call.setRequestedGsmSimSlot(requestedSimSlot);
                 mainHandler.post(() -> handleIncomingSipCall(call));
             } catch (Exception e) {
                 Log.e(TAG, "Error creating call: " + e.getMessage());

@@ -4,6 +4,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
+import android.telecom.PhoneAccount;
 import android.telecom.PhoneAccountHandle;
 import android.telecom.TelecomManager;
 import android.telephony.SubscriptionInfo;
@@ -16,6 +17,7 @@ import org.onetwoone.gateway.GatewayInCallService;
 import org.onetwoone.gateway.config.GatewayConfig;
 import org.pjsip.pjsua2.*;
 
+import java.lang.reflect.Method;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -166,9 +168,12 @@ public class CallManager {
         // Extract destination from LOCAL URI (the number being called = GSM destination)
         String dest = extractPhoneNumber(localUri);
 
-        // Determine SIM slot from caller extension in remote URI
-        String callerExt = extractExtension(remoteUri);
-        int simSlot = config.getSimSlotForCaller(callerExt);
+        // An explicit X-GSM-SIM header overrides the legacy extension mapping.
+        int simSlot = call.getRequestedGsmSimSlot();
+        if (simSlot == 0) {
+            String callerExt = extractExtension(remoteUri);
+            simSlot = config.getSimSlotForCaller(callerExt);
+        }
 
         if (dest == null || dest.isEmpty()) {
             Log.e(TAG, "No destination in localUri: " + localUri);
@@ -281,8 +286,21 @@ public class CallManager {
                 PhoneAccountHandle accountHandle = getPhoneAccountForSim(simSlot);
 
                 android.os.Bundle extras = new android.os.Bundle();
-                if (accountHandle != null) {
+                if (simSlot == 1 || simSlot == 2) {
+                    if (accountHandle == null) {
+                        throw new IllegalStateException(
+                            "Cannot select SIM " + simSlot
+                                + ": matching Android phone account was not found. "
+                                + "Check SIM subscriptions and call-capable phone accounts."
+                        );
+                    }
                     extras.putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, accountHandle);
+                    Log.i(TAG, "Placing call explicitly with SIM" + simSlot
+                        + ", phoneAccountId=" + accountHandle.getId()
+                        + ", component=" + accountHandle.getComponentName().flattenToShortString());
+                } else {
+                    Log.w(TAG, "SIM slot is not explicitly set (" + simSlot
+                        + "); Android will use the user-selected default phone account");
                 }
 
                 telecomManager.placeCall(uri, extras);
@@ -306,11 +324,21 @@ public class CallManager {
      * Get PhoneAccountHandle for specific SIM slot.
      */
     private PhoneAccountHandle getPhoneAccountForSim(int simSlot) {
-        try {
-            TelecomManager telecomManager = (TelecomManager) context.getSystemService(Context.TELECOM_SERVICE);
-            SubscriptionManager subManager = (SubscriptionManager) context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE);
+        if (simSlot != 1 && simSlot != 2) {
+            Log.e(TAG, "Invalid SIM slot requested: " + simSlot);
+            return null;
+        }
 
-            if (telecomManager == null || subManager == null) {
+        try {
+            TelecomManager telecomManager =
+                (TelecomManager) context.getSystemService(Context.TELECOM_SERVICE);
+            SubscriptionManager subManager =
+                (SubscriptionManager) context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE);
+            android.telephony.TelephonyManager telephonyManager =
+                (android.telephony.TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
+
+            if (telecomManager == null || subManager == null || telephonyManager == null) {
+                Log.e(TAG, "TelecomManager, SubscriptionManager or TelephonyManager is unavailable");
                 return null;
             }
 
@@ -318,28 +346,95 @@ public class CallManager {
             List<SubscriptionInfo> subs = subManager.getActiveSubscriptionInfoList();
 
             if (accounts == null || subs == null) {
+                Log.e(TAG, "Phone accounts or active SIM subscriptions list is null");
                 return null;
             }
 
-            // Find subscription for the requested slot
+            SubscriptionInfo requestedSubscription = null;
             for (SubscriptionInfo sub : subs) {
+                Log.i(TAG, "Active SIM: slotIndex=" + sub.getSimSlotIndex()
+                    + ", subscriptionId=" + sub.getSubscriptionId());
                 if (sub.getSimSlotIndex() + 1 == simSlot) {
-                    int subId = sub.getSubscriptionId();
-
-                    // Find matching phone account
-                    for (PhoneAccountHandle account : accounts) {
-                        String id = account.getId();
-                        if (id.contains(String.valueOf(subId))) {
-                            return account;
-                        }
-                    }
+                    requestedSubscription = sub;
                 }
             }
+
+            if (requestedSubscription == null) {
+                Log.e(TAG, "No active subscription found for SIM slot " + simSlot);
+                return null;
+            }
+
+            int requestedSubId = requestedSubscription.getSubscriptionId();
+            Log.i(TAG, "Resolving SIM" + simSlot + " by Android subscriptionId="
+                + requestedSubId + "; call-capable accounts=" + accounts.size());
+
+            for (PhoneAccountHandle handle : accounts) {
+                PhoneAccount phoneAccount = telecomManager.getPhoneAccount(handle);
+                if (phoneAccount == null
+                        || !phoneAccount.hasCapabilities(PhoneAccount.CAPABILITY_SIM_SUBSCRIPTION)) {
+                    continue;
+                }
+
+                int accountSubId = getSubscriptionIdForPhoneAccount(
+                    telephonyManager, phoneAccount, handle);
+
+                Log.i(TAG, "SIM account candidate: id=" + handle.getId()
+                    + ", subscriptionId=" + accountSubId
+                    + ", component=" + handle.getComponentName().flattenToShortString());
+
+                if (accountSubId == requestedSubId) {
+                    Log.i(TAG, "Selected SIM" + simSlot + " phone account: subscriptionId="
+                        + requestedSubId + ", accountId=" + handle.getId());
+                    return handle;
+                }
+            }
+
+            Log.e(TAG, "No SIM phone account matched SIM" + simSlot
+                + " (subscriptionId=" + requestedSubId + ")");
+        } catch (SecurityException e) {
+            Log.e(TAG, "Permission denied while resolving SIM phone account", e);
         } catch (Exception e) {
-            Log.w(TAG, "Error getting phone account: " + e.getMessage());
+            Log.e(TAG, "Error getting phone account for SIM" + simSlot, e);
         }
 
         return null;
+    }
+
+    /**
+     * Resolve the subscription ID from the phone account itself.
+     *
+     * Android 11 (API 30) exposes getSubscriptionId(PhoneAccountHandle) publicly.
+     * Android 10 has the equivalent hidden getSubIdForPhoneAccount(PhoneAccount)
+     * method in TelephonyManager. The latter is a greylisted platform API and is
+     * accessed reflectively for compatibility with the app's API 29 target device.
+     */
+    private int getSubscriptionIdForPhoneAccount(
+            android.telephony.TelephonyManager telephonyManager,
+            PhoneAccount phoneAccount,
+            PhoneAccountHandle handle) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Method publicMethod = android.telephony.TelephonyManager.class.getMethod(
+                    "getSubscriptionId", PhoneAccountHandle.class);
+                Object value = publicMethod.invoke(telephonyManager, handle);
+                if (value instanceof Integer) {
+                    return (Integer) value;
+                }
+            } else {
+                Method android10Method = android.telephony.TelephonyManager.class.getDeclaredMethod(
+                    "getSubIdForPhoneAccount", PhoneAccount.class);
+                android10Method.setAccessible(true);
+                Object value = android10Method.invoke(telephonyManager, phoneAccount);
+                if (value instanceof Integer) {
+                    return (Integer) value;
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Could not resolve subscription ID from PhoneAccount: "
+                + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+
+        return SubscriptionManager.INVALID_SUBSCRIPTION_ID;
     }
 
     /**
