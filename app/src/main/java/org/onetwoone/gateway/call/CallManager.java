@@ -4,6 +4,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
+import android.telecom.PhoneAccount;
 import android.telecom.PhoneAccountHandle;
 import android.telecom.TelecomManager;
 import android.telephony.SubscriptionInfo;
@@ -284,8 +285,21 @@ public class CallManager {
                 PhoneAccountHandle accountHandle = getPhoneAccountForSim(simSlot);
 
                 android.os.Bundle extras = new android.os.Bundle();
-                if (accountHandle != null) {
+                if (simSlot == 1 || simSlot == 2) {
+                    if (accountHandle == null) {
+                        throw new IllegalStateException(
+                            "Cannot select SIM " + simSlot
+                                + ": matching Android phone account was not found. "
+                                + "Check SIM subscriptions and call-capable phone accounts."
+                        );
+                    }
                     extras.putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, accountHandle);
+                    Log.i(TAG, "Placing call explicitly with SIM" + simSlot
+                        + ", phoneAccountId=" + accountHandle.getId()
+                        + ", component=" + accountHandle.getComponentName().flattenToShortString());
+                } else {
+                    Log.w(TAG, "SIM slot is not explicitly set (" + simSlot
+                        + "); Android will use the user-selected default phone account");
                 }
 
                 telecomManager.placeCall(uri, extras);
@@ -309,11 +323,19 @@ public class CallManager {
      * Get PhoneAccountHandle for specific SIM slot.
      */
     private PhoneAccountHandle getPhoneAccountForSim(int simSlot) {
+        if (simSlot != 1 && simSlot != 2) {
+            Log.w(TAG, "Invalid SIM slot requested: " + simSlot);
+            return null;
+        }
+
         try {
-            TelecomManager telecomManager = (TelecomManager) context.getSystemService(Context.TELECOM_SERVICE);
-            SubscriptionManager subManager = (SubscriptionManager) context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE);
+            TelecomManager telecomManager =
+                (TelecomManager) context.getSystemService(Context.TELECOM_SERVICE);
+            SubscriptionManager subManager =
+                (SubscriptionManager) context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE);
 
             if (telecomManager == null || subManager == null) {
+                Log.e(TAG, "TelecomManager or SubscriptionManager is unavailable");
                 return null;
             }
 
@@ -321,25 +343,57 @@ public class CallManager {
             List<SubscriptionInfo> subs = subManager.getActiveSubscriptionInfoList();
 
             if (accounts == null || subs == null) {
+                Log.e(TAG, "Phone accounts or active SIM subscriptions list is null");
                 return null;
             }
 
-            // Find subscription for the requested slot
-            for (SubscriptionInfo sub : subs) {
-                if (sub.getSimSlotIndex() + 1 == simSlot) {
-                    int subId = sub.getSubscriptionId();
+            Log.i(TAG, "Resolving requested SIM slot " + simSlot
+                + "; active subscriptions=" + subs.size()
+                + "; call-capable accounts=" + accounts.size());
 
-                    // Find matching phone account
-                    for (PhoneAccountHandle account : accounts) {
-                        String id = account.getId();
-                        if (id.contains(String.valueOf(subId))) {
-                            return account;
-                        }
+            // Android 10 (API 29): the platform telephony connection service identifies
+            // a SIM PhoneAccountHandle by its subscription ID in getId(). Compare exactly;
+            // substring matching can select the wrong SIM (for example, ID 1 matching 10/11).
+            for (SubscriptionInfo sub : subs) {
+                int slotIndex = sub.getSimSlotIndex();
+                int subId = sub.getSubscriptionId();
+                Log.d(TAG, "Active SIM: slotIndex=" + slotIndex + ", subscriptionId=" + subId);
+
+                if (slotIndex + 1 != simSlot) {
+                    continue;
+                }
+
+                String expectedAccountId = String.valueOf(subId);
+                for (PhoneAccountHandle handle : accounts) {
+                    String accountId = handle.getId();
+                    PhoneAccount phoneAccount = telecomManager.getPhoneAccount(handle);
+                    int capabilities = phoneAccount != null
+                        ? phoneAccount.getCapabilities() : 0;
+                    boolean isSimAccount = (capabilities
+                        & PhoneAccount.CAPABILITY_SIM_SUBSCRIPTION) != 0;
+
+                    Log.d(TAG, "Call account candidate: id=" + accountId
+                        + ", component=" + handle.getComponentName().flattenToShortString()
+                        + ", simSubscription=" + isSimAccount);
+
+                    if (expectedAccountId.equals(accountId) && isSimAccount) {
+                        Log.i(TAG, "Selected SIM" + simSlot + " phone account: subId="
+                            + subId + ", accountId=" + accountId);
+                        return handle;
                     }
                 }
+
+                Log.e(TAG, "No SIM phone account matched slot " + simSlot
+                    + " (subscriptionId=" + subId + ", expected account id="
+                    + expectedAccountId + ")");
+                return null;
             }
+
+            Log.e(TAG, "No active subscription found for SIM slot " + simSlot);
+        } catch (SecurityException e) {
+            Log.e(TAG, "Permission denied while resolving SIM phone account", e);
         } catch (Exception e) {
-            Log.w(TAG, "Error getting phone account: " + e.getMessage());
+            Log.e(TAG, "Error getting phone account for SIM" + simSlot, e);
         }
 
         return null;
